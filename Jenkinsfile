@@ -6,7 +6,6 @@ pipeline {
         AWS_REGION = 'ap-south-1'
         ECR_REPOSITORY = 'cicd-demo'
         APP_HOST = '172.31.14.218'
-        APP_USER = 'ubuntu'
         APP_CONTAINER = 'cicd-demo'
     }
 
@@ -81,100 +80,95 @@ pipeline {
                         set -e
 
                         ssh -i "$SSH_KEY" \
+                            -o IdentitiesOnly=yes \
                             -o StrictHostKeyChecking=accept-new \
-                            ${SSH_USER}@${APP_HOST} \
-                            "AWS_REGION=${AWS_REGION} \
-                            ECR_URI=${ECR_URI} \
-                            IMAGE_TAG=${BUILD_NUMBER} \
-                            APP_CONTAINER=${APP_CONTAINER} bash -s" <<'REMOTE'
+                            "${SSH_USER}@${APP_HOST}" \
+                            "AWS_REGION='${AWS_REGION}' ECR_URI='${ECR_URI}' IMAGE_TAG='${BUILD_NUMBER}' APP_CONTAINER='${APP_CONTAINER}' bash -s" <<'REMOTE'
 
-                        set -e
+set -e
 
-                        NEW_IMAGE="${ECR_URI}:${IMAGE_TAG}"
+NEW_IMAGE="${ECR_URI}:${IMAGE_TAG}"
 
-                        echo "Logging into Amazon ECR..."
+echo "Logging into Amazon ECR..."
 
-                        aws ecr get-login-password --region "$AWS_REGION" |
-                        docker login --username AWS --password-stdin \
-                        "$(echo "$ECR_URI" | cut -d/ -f1)"
+aws ecr get-login-password --region "$AWS_REGION" |
+docker login --username AWS --password-stdin "$(echo "$ECR_URI" | cut -d/ -f1)"
 
-                        echo "Pulling new Docker image..."
+echo "Pulling new Docker image..."
 
-                        docker pull "$NEW_IMAGE"
+docker pull "$NEW_IMAGE"
 
-                        OLD_IMAGE=""
+OLD_IMAGE=""
 
-                        if docker container inspect "$APP_CONTAINER" >/dev/null 2>&1
-                        then
-                            OLD_IMAGE=$(docker inspect \
-                                --format='{{.Config.Image}}' "$APP_CONTAINER")
+if docker container inspect "$APP_CONTAINER" >/dev/null 2>&1
+then
+    OLD_IMAGE=$(docker inspect --format='{{.Config.Image}}' "$APP_CONTAINER")
+    echo "Previous image: $OLD_IMAGE"
 
-                            echo "Previous image: $OLD_IMAGE"
+    docker stop "$APP_CONTAINER" || true
+    docker rm "$APP_CONTAINER" || true
+fi
 
-                            docker stop "$APP_CONTAINER" || true
-                            docker rm "$APP_CONTAINER" || true
-                        fi
+echo "Starting new application..."
 
-                        echo "Starting new application..."
+if ! docker run -d 
+    --name "$APP_CONTAINER" 
+    --restart unless-stopped 
+    -p 5000:5000 
+    "$NEW_IMAGE"
+then
+    echo "New container failed. Rolling back..."
 
-                        if ! docker run -d \
-                            --name "$APP_CONTAINER" \
-                            --restart unless-stopped \
-                            -p 5000:5000 \
-                            "$NEW_IMAGE"
-                        then
-                            echo "New container failed. Rolling back..."
+    if [ -n "$OLD_IMAGE" ]; then
+        docker run -d \
+            --name "$APP_CONTAINER" \
+            --restart unless-stopped \
+            -p 5000:5000 \
+            "$OLD_IMAGE"
+    fi
 
-                            if [ -n "$OLD_IMAGE" ]; then
-                                docker run -d \
-                                    --name "$APP_CONTAINER" \
-                                    --restart unless-stopped \
-                                    -p 5000:5000 \
-                                    "$OLD_IMAGE"
-                            fi
+    exit 1
+fi
 
-                            exit 1
-                        fi
+echo "Checking application health..."
 
-                        echo "Checking application health..."
+HEALTHY=0
 
-                        HEALTHY=0
+for i in $(seq 1 12)
+do
+    if curl -fsS http://localhost:5000/health
+    then
+        HEALTHY=1
+        break
+    fi
 
-                        for i in $(seq 1 12)
-                        do
-                            if curl -fsS http://localhost:5000/health
-                            then
-                                HEALTHY=1
-                                break
-                            fi
+    sleep 5
+done
 
-                            sleep 5
-                        done
+if [ "$HEALTHY" -eq 1 ]; then
+    echo "Deployment successful!"
+else
+    echo "Health check failed. Rolling back..."
 
-                        if [ "$HEALTHY" -eq 1 ]; then
-                            echo "Deployment successful!"
-                        else
-                            echo "Health check failed. Rolling back..."
+    docker stop "$APP_CONTAINER" || true
+    docker rm "$APP_CONTAINER" || true
 
-                            docker stop "$APP_CONTAINER" || true
-                            docker rm "$APP_CONTAINER" || true
+    if [ -n "$OLD_IMAGE" ]; then
+        docker run -d \
+            --name "$APP_CONTAINER" \
+            --restart unless-stopped \
+            -p 5000:5000 \
+            "$OLD_IMAGE"
 
-                            if [ -n "$OLD_IMAGE" ]; then
-                                docker run -d \
-                                    --name "$APP_CONTAINER" \
-                                    --restart unless-stopped \
-                                    -p 5000:5000 \
-                                    "$OLD_IMAGE"
+        echo "Previous version restored."
+    else
+        echo "No previous version available."
+    fi
 
-                                echo "Previous version restored."
-                            else
-                                echo "No previous version available."
-                            fi
+    exit 1
+fi
 
-                            exit 1
-                        fi
-
-                        REMOTE
+REMOTE
                     '''
                 }
             }
